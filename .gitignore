@@ -1,0 +1,12 @@
+.env
+credentials.json
+client_secret.json
+token.json
+*.json
+!config.example.env
+instagram_cookies.txt
+__pycache__/
+.venv/
+venv/
+*.pyc
+.DS_Store
