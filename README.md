@@ -51,7 +51,11 @@ pip install -r requirements.txt
 | `URL_COLUMN` | 链接所在列字母，如 `A` |
 | `NAME_COLUMN` | 文件名所在列字母，如 `B` |
 | `HEADER_ROWS` | 表头行数，数据从下一行开始，默认 `1` |
+| `RESULT_COLUMN` | 视频 Drive 链接写回的列（如 C） |
+| `THUMBNAIL_COLUMN` | 封面图写回的列（如 D）；留空则不下载封面。该列写入 **=IMAGE(直接地址)**，单元格内**显示图片**而非纯链接；导到飞书多维表格时可用该直接地址（见下方说明）。若无平台封面则用 ffmpeg 截一帧（需本机已装 ffmpeg） |
 | `DRIVE_FOLDER_ID` | 可选。上传到的 Drive 文件夹 ID（浏览器打开文件夹时 URL 里 `/folders/` 后面的那串） |
+| `DO_VIDEO` | 默认 `1`。为 `0` 时本次不下载/上传视频，只做封面（若 DO_COVER=1） |
+| `DO_COVER` | 默认 `1`。为 `0` 时本次不下载/导出封面，只做视频。可组合：只做视频、只做封面、或两个都做 |
 | `COOKIES_FILE` | 可选。Instagram 的 cookies 文件路径，若下载被限流可导出浏览器 cookies 再试 |
 
 ### 4. Instagram 下载说明
@@ -81,8 +85,37 @@ ins_to_drive/
 └── README.md
 ```
 
+## 飞书多维表格「文件」列（封面以文件形式写入）
+
+若飞书多维表格里有一列类型为「**文件**」，需要把封面**图片文件**上传到该列（而非仅链接）：
+
+1. 在 [飞书开放平台](https://open.feishu.cn/) 创建应用，开通权限：**查看、评论、编辑和管理多维表格**、**上传下载云文档**（或驱动相关权限）。
+2. **把应用加到多维表格**（否则接口会返回 403 / 91403 Forbidden）：
+   - 用**浏览器**打开该多维表格（飞书网页版 feishu.cn），不要用桌面客户端。
+   - 点击右上角 **「…」**（三个点）→ 选 **「更多」** → 在列表里找 **「添加文档应用」** 或 **「添加应用」** → 搜索你的自建应用并添加。
+   - 若菜单里没有「添加文档应用」，请用**文档所有者**或**有分享/管理权限**的账号操作，或联系管理员；部分版本该入口仅在网页版显示。
+3. 获取 **app_id**、**app_secret**；从多维表格 URL 获取 **app_token**（如 `https://xxx.feishu.cn/base/AppToken?table=TableId` 中的 `AppToken`）和 **table_id**（数据表 ID）。
+4. 在 `.env` 中填写：
+   - `FEISHU_APP_ID`、`FEISHU_APP_SECRET`、`FEISHU_APP_TOKEN`、`FEISHU_TABLE_ID`
+   - `FEISHU_MATCH_FIELD`：飞书中用于**匹配当前行**的字段名（如「文件名」），其值需与 Google 表格里的「命名」列一致，脚本会按此找到对应记录。
+   - `FEISHU_FILE_FIELD`：要写入封面文件的「**文件**」类型列名（如「封面」）。
+5. 运行脚本后，封面会先上传到 Drive 并写回 Google 表格；若上述飞书配置完整，会**同时**把封面图片上传到飞书并写入对应记录的「文件」列。
+
+Google 表格中的封面列仍是 **=IMAGE(...)** 显示图片；飞书侧是真正的**文件附件**。
+
+### 若直接写飞书失败：用「导出包」再推送到飞书
+
+Sheet 里是图片公式不是原图，无法直接复制到飞书。若 main.py 写飞书报错，可用「先导出、再推送」：
+
+1. 在 `.env` 里增加一行：**`FEISHU_EXPORT_DIR=feishu_export`**（或任意目录名）。
+2. 照常运行 **`python main.py`**。脚本会把每条**封面原图**保存到 `feishu_export/covers/`，并把「命名、视频 Drive 链接、封面文件名」追加到 `feishu_export/links.csv`。
+3. 再运行 **`python push_export_to_feishu.py`**，会按 CSV 逐行：上传封面到飞书、按「命名」找到对应记录、写入「文件」列和「链接」列。
+
+这样你本地始终有一份**封面原图 + 链接表**，可随时重跑推送脚本，或手动在飞书里对照 CSV 上传。
+
 ## 常见问题
 
 - **无法打开表格**：确认已把表格共享给 `credentials.json` 里 `client_email` 的邮箱。  
 - **无法上传到文件夹**：确认该 Drive 文件夹已共享给同一服务账号邮箱且权限足够。  
+- **表格里封面不显示**：检查 Drive 里对应封面文件是否已设为「知道链接的任何人可查看」。  
 - **下载失败**：先单独用 `yt-dlp "链接"` 测试；Ins/TikTok 等若需登录，配置 `COOKIES_FILE` 并保持 yt-dlp 更新（`yt-dlp -U`）。
