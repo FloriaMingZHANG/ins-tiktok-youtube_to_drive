@@ -5,19 +5,18 @@
 用法：在 ins_to_drive 目录下执行  python push_export_to_feishu.py
 """
 import csv
+import os
 import sys
 from pathlib import Path
 
-# 使用与 main 相同的 .env 和飞书逻辑
 from dotenv import load_dotenv
 load_dotenv()
 
-# 从 main 复用飞书相关变量与函数（不执行 main）
-import main as main_module
+import feishu
 
-FEISHU_EXPORT_DIR = getattr(main_module, "FEISHU_EXPORT_DIR", "").strip() or "feishu_export"
-FEISHU_MATCH_FIELD = main_module.FEISHU_MATCH_FIELD
-FEISHU_DRIVE_LINK_FIELD = main_module.FEISHU_DRIVE_LINK_FIELD
+FEISHU_EXPORT_DIR = os.getenv("FEISHU_EXPORT_DIR", "").strip() or "feishu_export"
+FEISHU_MATCH_FIELD = feishu.FEISHU_MATCH_FIELD
+FEISHU_DRIVE_LINK_FIELD = feishu.FEISHU_DRIVE_LINK_FIELD
 
 
 def run():
@@ -45,11 +44,11 @@ def run():
         print("links.csv 中没有数据行。")
         sys.exit(0)
 
-    token = main_module._feishu_tenant_token()
+    token = feishu.feishu_tenant_token()
     if not token:
         print("飞书 token 获取失败，请检查 .env 中 FEISHU_APP_ID、FEISHU_APP_SECRET。")
         sys.exit(1)
-    field_ids = main_module._feishu_get_field_ids(token)
+    field_ids = feishu.feishu_get_field_ids(token)
     if not field_ids:
         print("飞书获取字段列表失败。")
         sys.exit(1)
@@ -63,17 +62,17 @@ def run():
             print(f"  跳过：封面文件不存在 {cover_path}")
             skip += 1
             continue
-        ftok = main_module._feishu_upload_media(cover_path, cover_file, token)
+        ftok = feishu.feishu_upload_media(cover_path, cover_file, token)
         if not ftok:
             print(f"  上传封面失败")
             fail += 1
             continue
-        rid = main_module._feishu_find_record_id_by_field(token, name, field_ids)
+        rid = feishu.feishu_find_record_id_by_field(token, name, field_ids)
         if not rid:
             print(f"  未找到匹配记录（飞表「{FEISHU_MATCH_FIELD}」列需有值 {name}）")
             fail += 1
             continue
-        if main_module._feishu_update_record(token, rid, ftok, field_ids, drive_link=drive_link):
+        if feishu.feishu_update_record(token, rid, ftok, field_ids, drive_link=drive_link):
             print(f"  已写入飞书")
             ok += 1
         else:

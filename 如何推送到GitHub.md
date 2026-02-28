@@ -55,8 +55,8 @@ git remote add origin https://github.com/FloriaMingZHANG/ins-tiktok-youtube_to_d
 # 主分支叫 main
 git branch -M main
 
-# 把 GitHub 上已有的 LICENSE 拉下来合并（仓库里已有内容时需要）
-git pull origin main --allow-unrelated-histories --no-edit
+# 把 GitHub 上已有的 LICENSE 拉下来合并（用 merge，避免 divergent 报错）
+git pull origin main --allow-unrelated-histories --no-rebase --no-edit
 
 # 推送到 GitHub
 git push -u origin main
@@ -144,7 +144,54 @@ git push
 
 ---
 
-## 三、安全提醒：这些文件不会上传
+## 三、用分支做新功能（和稳定版分开）
+
+想加新功能又怕改坏现在能用的版本时，用**新分支**开发，本地就能把“稳定版”和“新功能”分开。
+
+### 1. 新建并切到功能分支
+
+在 **ins_to_drive** 目录下执行（分支名可自定，如 `feature/新功能名`）：
+
+```bash
+cd /Users/floriazhang/Library/CloudStorage/OneDrive-bfsu.edu.cn/cursor/ins_to_drive
+
+# 确保当前在 main 且没有未提交的改动
+git checkout main
+git status
+
+# 新建分支并切换过去（分支名可改成你要的，如 feature/xxx）
+git checkout -b feature/new-feature
+```
+
+之后所有改代码、加文件都在 **feature/new-feature** 上，**main 不动**。
+
+### 2. 日常怎么用
+
+| 想做的事           | 执行 |
+|--------------------|------|
+| 开发 / 改新功能    | `git checkout feature/new-feature`，然后正常改代码、`git add`、`git commit` |
+| 用回稳定版跑脚本   | `git checkout main`，然后照常 `python3 main.py` 或 `run.bat` / `run.sh` |
+| 看当前在哪个分支   | `git branch`（前面有 * 的就是当前分支） |
+
+### 3. 新功能做完、想并回稳定版
+
+在 **ins_to_drive** 目录下：
+
+```bash
+git checkout main
+git merge feature/new-feature -m "Merge: 新功能描述"
+git push origin main
+```
+
+之后 main 就是“稳定版 + 新功能”。若还想继续在分支上改，可以再 `git checkout feature/new-feature`。
+
+### 4. 不想合并、只想保留分支
+
+不执行上面的 `git merge` 即可。main 一直是你之前完善的版本；分支只在本地（或你单独 `git push origin feature/new-feature`）保留。
+
+---
+
+## 四、安全提醒：这些文件不会上传
 
 `.gitignore` 已配置，以下内容**不会**被 `git add` 进去，也不会出现在 GitHub 上：
 
@@ -155,3 +202,7 @@ git push
 - `.venv/`、`venv/`
 
 推送前用 `git status` 看一眼，列表里不应出现上述文件名；若出现，说明 .gitignore 被改过，需要改回再提交。
+
+---
+
+（《如何推送到GitHub.md》完）
