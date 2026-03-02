@@ -4,15 +4,21 @@
 
 **支持平台**：Instagram（含 Reels）、TikTok、YouTube、YouTube Shorts 等所有 yt-dlp 支持的平台。
 
+**支持系统**：Mac / Windows（v0.3.0 起新增 Windows 一键配置，详见 [RELEASE_NOTES_v0.3.0.md](RELEASE_NOTES_v0.3.0.md)）
+
 ---
 
 ## 快速开始
 
 ### 1. 安装依赖
 
+**Windows（推荐）**：双击运行 `setup_windows.bat` 完成一键配置。
+
+**Mac / 手动安装**：
+
 ```bash
 python3 -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
+source .venv/bin/activate   # Windows CMD: .venv\Scripts\activate.bat   # PowerShell: .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 

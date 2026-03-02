@@ -337,7 +337,7 @@ def main():
     failures = []  # (base_name, 原因, 详细错误信息, 表格行号)
     for i, (url, base_name, sheet_row) in enumerate(data, 1):
         print(f"[{i}/{len(data)}] {base_name}")
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             video_path, thumb_path = None, None
             drive_link = ""
             if DO_VIDEO:
