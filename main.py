@@ -37,6 +37,30 @@ SCOPES = [
 
 load_dotenv()
 
+# 确保 yt-dlp（venv Scripts）和 ffmpeg 在 PATH 中，无论从何处调用都能找到
+_scripts_dir = str(Path(sys.executable).parent)
+_ffmpeg_candidates = [
+    # WinGet 安装路径
+    str(Path.home() / "AppData/Local/Microsoft/WinGet/Links"),
+    # Chocolatey / scoop 常见位置
+    r"C:\ProgramData\chocolatey\bin",
+    r"C:\tools\ffmpeg\bin",
+]
+_extra_paths = [_scripts_dir] + [p for p in _ffmpeg_candidates if Path(p).exists()]
+os.environ["PATH"] = os.pathsep.join(_extra_paths) + os.pathsep + os.environ.get("PATH", "")
+
+# YouTube JS 挑战解析：Node.js 已安装时自动启用 EJS 远程组件，解决"Sign in to confirm you're not a bot"
+_node_exe = next(
+    (p for p in [
+        str(Path("C:/Program Files/nodejs/node.exe")),
+        str(Path.home() / "AppData/Roaming/nvm/current/node.exe"),
+    ] if Path(p).exists()),
+    None,
+)
+# --js-runtimes 格式：node 或 node:/path/to/node.exe
+_node_runtime = f"node:{_node_exe}" if _node_exe else "node"
+_YT_JS_ARGS = ["--js-runtimes", _node_runtime, "--remote-components", "ejs:github"]
+
 # 表格
 SPREADSHEET_URL = os.getenv("SPREADSHEET_URL", "").strip()
 SPREADSHEET_KEY = os.getenv("SPREADSHEET_KEY", "").strip()
@@ -551,6 +575,7 @@ def download_video(
             "--retries", str(DOWNLOAD_RETRIES),
             "--fragment-retries", str(DOWNLOAD_RETRIES),
             "--extractor-args", extractor_args,
+            *_YT_JS_ARGS,               # Node.js + EJS 远程组件，解决 YouTube JS 挑战
             url,
         ]
         if with_thumbnail:
@@ -644,6 +669,7 @@ def download_thumbnail_only(
         "-o", thumb_tpl,
         "--socket-timeout", str(SOCKET_TIMEOUT),
         "--retries", str(DOWNLOAD_RETRIES),
+        *_YT_JS_ARGS,
         url,
     ]
     if cookies_file and os.path.isfile(cookies_file):
@@ -661,6 +687,7 @@ def download_thumbnail_only(
                 "--format", "bestimage",
                 "--socket-timeout", str(SOCKET_TIMEOUT),
                 "--retries", str(DOWNLOAD_RETRIES),
+                *_YT_JS_ARGS,
                 url,
             ]
             if cookies_file and os.path.isfile(cookies_file):
