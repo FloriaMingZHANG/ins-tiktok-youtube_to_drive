@@ -3,7 +3,7 @@
 
 import os
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -18,59 +18,23 @@ FEISHU_FILE_FIELD = os.getenv("FEISHU_FILE_FIELD", "").strip()
 FEISHU_DRIVE_LINK_FIELD = os.getenv("FEISHU_DRIVE_LINK_FIELD", "").strip()
 
 
-def feishu_list_records(token: str) -> List[dict]:
-    """分页拉取飞书表全部记录，返回 [{record_id, fields}, ...]。"""
-    import requests
-    url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{FEISHU_APP_TOKEN}/tables/{FEISHU_TABLE_ID}/records"
-    results: List[dict] = []
-    page_token = None
-    for _ in range(100):
-        params: dict = {"page_size": 500}
-        if page_token:
-            params["page_token"] = page_token
-        r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, params=params, timeout=15)
-        if r.status_code != 200:
-            print(f"  飞书拉取记录 HTTP {r.status_code}: {r.text[:200]}")
-            break
-        d = r.json()
-        if d.get("code") != 0:
-            print(f"  飞书拉取记录失败: code={d.get('code')} msg={d.get('msg', '')}")
-            break
-        items = (d.get("data") or {}).get("items") or []
-        results.extend(items)
-        page_token = (d.get("data") or {}).get("page_token")
-        if not page_token:
-            break
-    return results
-
-
 def feishu_tenant_token() -> Optional[str]:
     """获取飞书 tenant_access_token。"""
     if not FEISHU_APP_ID or not FEISHU_APP_SECRET:
-        print("  飞书：FEISHU_APP_ID 或 FEISHU_APP_SECRET 未配置，请检查 .env")
         return None
     try:
         import requests
         r = requests.post(
             "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
             json={"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET},
-            timeout=15,
+            timeout=10,
         )
-        if r.status_code != 200:
-            print(f"  飞书 token 获取失败，HTTP {r.status_code}: {r.text[:200]}")
-            return None
         d = r.json()
         if d.get("code") == 0:
             return d.get("tenant_access_token")
-        print(f"  飞书 token 获取失败: code={d.get('code')} msg={d.get('msg', '')} (code=99 表示 APP_ID/SECRET 错误)")
-        return None
-    except Exception as e:
-        print(f"  飞书 token 获取异常: {type(e).__name__}: {e}")
-        if "ProxyError" in type(e).__name__ or "proxy" in str(e).lower():
-            print("  提示：网络代理阻断了到 open.feishu.cn 的连接，请检查代理设置或在无代理环境下运行。")
-        elif "ConnectionError" in type(e).__name__ or "Failed to establish" in str(e):
-            print("  提示：无法连接到 open.feishu.cn，请检查网络连接。")
-        return None
+    except Exception:
+        pass
+    return None
 
 
 def feishu_get_field_ids(token: str) -> Optional[dict]:
@@ -109,19 +73,10 @@ def feishu_get_field_ids(token: str) -> Optional[dict]:
 
 def feishu_upload_media(file_path: Path, file_name: str, token: str) -> Optional[str]:
     """上传文件到飞书多维表格素材，返回 file_token。"""
-    if not FEISHU_APP_TOKEN:
-        print("  飞书：FEISHU_APP_TOKEN 未配置，请检查 .env")
-        return None
     try:
         import requests
         url = "https://open.feishu.cn/open-apis/drive/v1/medias/upload_all"
         size = file_path.stat().st_size
-        ext = file_path.suffix.lower().lstrip(".")
-        mime = {
-            "jpg": "image/jpeg", "jpeg": "image/jpeg",
-            "png": "image/png", "webp": "image/webp",
-            "gif": "image/gif",
-        }.get(ext, "application/octet-stream")
         with open(file_path, "rb") as f:
             file_bytes = f.read()
         r = requests.post(
@@ -133,26 +88,19 @@ def feishu_upload_media(file_path: Path, file_name: str, token: str) -> Optional
                 "parent_node": FEISHU_APP_TOKEN,
                 "size": str(size),
             },
-            files={"file": (file_name, file_bytes, mime)},
-            timeout=60,
+            files={"file": (file_name, file_bytes, "application/octet-stream")},
+            timeout=30,
         )
         if r.status_code != 200:
-            print(f"  飞书上传封面 HTTP {r.status_code}: {r.text[:300]}")
-            if r.status_code == 403:
-                print("  提示：403 表示应用无权访问该多维表格，请在飞书网页版打开多维表格 → 右上角「…」→「添加文档应用」添加你的应用。")
+            print(f"  飞书上传封面 HTTP {r.status_code}: {r.text[:200]}")
             return None
         d = r.json()
         if d.get("code") != 0:
             print(f"  飞书上传封面失败: code={d.get('code')} msg={d.get('msg', '')}")
-            if d.get("code") == 230001:
-                print("  提示：file_token 所属应用与表格不一致，请检查 FEISHU_APP_TOKEN 是否为该多维表格的 appToken。")
             return None
-        file_token = d.get("data", {}).get("file_token")
-        if not file_token:
-            print(f"  飞书上传封面：响应中无 file_token，原始响应: {d}")
-        return file_token
+        return d.get("data", {}).get("file_token")
     except Exception as e:
-        print(f"  飞书上传封面异常: {type(e).__name__}: {e}")
+        print(f"  飞书上传封面异常: {e}")
         return None
 
 
@@ -221,27 +169,29 @@ def feishu_get_record(token: str, record_id: str, use_field_id_key: bool = True)
 
 
 def feishu_update_record(
-    token: str, record_id: str, file_token: Optional[str], field_ids: dict, drive_link: Optional[str] = None
+    token: str, record_id: str, file_token: str, field_ids: dict, drive_link: Optional[str] = None
 ) -> bool:
-    """更新飞书多维表格记录：仅发送要修改的字段（文件列 和/或 Drive 链接列），不回传其余字段。
-    file_token 为 None 时跳过文件列，仅写链接列。"""
+    """更新飞书多维表格记录：仅修改「文件」列和「Drive 链接」列，先拉取原记录再合并。"""
     file_fid = field_ids.get(FEISHU_FILE_FIELD) if field_ids else None
-    if file_token and not file_fid:
+    if not file_fid:
         print(f"  飞书未找到文件列「{FEISHU_FILE_FIELD}」")
-        return False
-    if not file_token and not (FEISHU_DRIVE_LINK_FIELD and drive_link):
-        print(f"  飞书：file_token 与 drive_link 均为空，无内容可写")
         return False
     try:
         import requests
-        # 只发要改的字段，避免回传旧字段触发格式校验错误（如 1254067 LinkFieldConvFail）
-        fields: dict = {}
-        if file_token:
-            fields[FEISHU_FILE_FIELD] = [{"file_token": file_token}]
+        record = feishu_get_record(token, record_id)
+        if record is None:
+            print(f"  飞书获取记录失败，为避免覆盖其它列，跳过本次更新")
+            return False
+        raw_fields = record.get("fields") or {}
+        id_to_name = {v: k for k, v in field_ids.items()}
+        fields = {}
+        for k, v in raw_fields.items():
+            key_name = id_to_name.get(k) if k in id_to_name else (k if k in field_ids else k)
+            fields[key_name] = v
+        fields[FEISHU_FILE_FIELD] = [{"file_token": file_token}]
         if FEISHU_DRIVE_LINK_FIELD and drive_link:
             fields[FEISHU_DRIVE_LINK_FIELD] = {"link": drive_link, "text": drive_link}
-        written = list(fields.keys())
-        print(f"  飞书本次写入列：{'、'.join(f'「{c}」' for c in written)}")
+        print(f"  飞书本次写入列：文件列「{FEISHU_FILE_FIELD}」、链接列「{FEISHU_DRIVE_LINK_FIELD or '(未配置)'}」")
         api_url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{FEISHU_APP_TOKEN}/tables/{FEISHU_TABLE_ID}/records/{record_id}"
         r = requests.put(
             api_url,
@@ -253,26 +203,40 @@ def feishu_update_record(
             print(f"  飞书更新记录 HTTP {r.status_code}: {r.text[:200]}")
             return False
         d = r.json()
-        # 链接列格式不兼容时，退回纯文本写法重试
         if d.get("code") == 1254067 and FEISHU_DRIVE_LINK_FIELD and drive_link:
-            print(f"  飞书 1254067：链接列「{FEISHU_DRIVE_LINK_FIELD}」超链接格式不兼容，改用纯文本重试…")
-            fields[FEISHU_DRIVE_LINK_FIELD] = drive_link
+            print(f"  飞书 1254067：链接列「{FEISHU_DRIVE_LINK_FIELD}」写入失败，正在重试：先仅写文件列…")
+            del fields[FEISHU_DRIVE_LINK_FIELD]
             r2 = requests.put(
                 api_url,
                 headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
                 json={"fields": fields},
                 timeout=15,
             )
-            d2 = r2.json() if r2.status_code == 200 else {}
-            if d2.get("code") == 0:
-                print(f"  已写入飞书（链接列以纯文本写入）")
+            if r2.status_code == 200 and (r2.json() or {}).get("code") == 0:
+                record2 = feishu_get_record(token, record_id)
+                if record2:
+                    raw2 = record2.get("fields") or {}
+                    fields2 = {}
+                    for k, v in raw2.items():
+                        key_name = id_to_name.get(k) if k in id_to_name else (k if k in field_ids else k)
+                        fields2[key_name] = v
+                    fields2[FEISHU_DRIVE_LINK_FIELD] = drive_link
+                    r3 = requests.put(
+                        api_url,
+                        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                        json={"fields": fields2},
+                        timeout=15,
+                    )
+                    if r3.status_code == 200 and (r3.json() or {}).get("code") == 0:
+                        print(f"  已写入飞书：封面 + Drive 链接（链接列以纯文本写入）")
+                        return True
+                print(f"  已写入飞书：封面（链接列「{FEISHU_DRIVE_LINK_FIELD}」未写入，请检查该列在飞表中的类型是否为「超链接」或「文本」）")
                 return True
-            print(f"  飞书更新记录失败: code={d2.get('code')} msg={d2.get('msg', '')}")
+            print(f"  飞书更新记录失败: code={d.get('code')} msg={d.get('msg', '')}")
             return False
         if d.get("code") != 0:
             print(f"  飞书更新记录失败: code={d.get('code')} msg={d.get('msg', '')}")
             return False
-        print(f"  已写入飞书")
         return True
     except Exception as e:
         print(f"  飞书更新记录异常: {e}")

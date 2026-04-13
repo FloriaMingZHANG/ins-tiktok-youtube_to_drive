@@ -1,0 +1,38 @@
+========================================
+  导出 Instagram cookies（供 main.py 使用）
+========================================
+
+推荐扩展：Get cookies.txt LOCALLY
+- 评分 4.8，50 万+ 用户，开源，数据仅本地导出不上传
+- 支持 Netscape 格式（yt-dlp 所需）
+- Chrome 安装：https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc
+- Edge 也可用：在 Edge 里打开上述链接，选“从 Chrome 获取扩展”或直接在 Edge 扩展商店搜 “Get cookies.txt LOCALLY”
+
+----------------------------------------
+详细步骤（只需做一次）
+----------------------------------------
+
+第一步：安装扩展
+  1. 用 Chrome 或 Edge 打开上面的 Chrome 商店链接（或商店里搜索 “Get cookies.txt LOCALLY”）。
+  2. 点击“添加至 Chrome”/“获取”，按提示完成安装。
+
+第二步：在 Instagram 保持登录
+  1. 打开新标签页，访问 https://www.instagram.com
+  2. 若未登录，先登录你的账号；若已登录，保持当前页面即可。
+
+第三步：导出当前站点的 cookies
+  1. 确保当前标签页是 instagram.com（不要切到别的网站）。
+  2. 点击浏览器右上角扩展图标（拼图块）→ 找到 “Get cookies.txt LOCALLY” → 点击。
+  3. 在弹出窗口里：
+     - 格式选 “Netscape”（默认即可）。
+     - 点击 “Export” 或 “Download” 导出。
+  4. 浏览器会下载一个 .txt 文件（名字可能是 instagram.com_cookies.txt 或类似）。
+
+第四步：放到脚本目录并改名
+  1. 找到刚下载的文件（一般在“下载”文件夹）。
+  2. 把它改名为：cookies.txt
+  3. 剪贴或复制到 ins_to_drive 文件夹（和 main.py 同一目录），若提示是否覆盖选“是”。
+
+完成。以后直接运行：
+  python main.py both
+浏览器可以一直开着，无需关闭。若几周后又提示要登录，再按第三步、第四步导出一遍覆盖 cookies.txt 即可。

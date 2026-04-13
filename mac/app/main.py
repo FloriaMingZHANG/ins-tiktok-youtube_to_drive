@@ -10,7 +10,6 @@ import os
 import re
 import subprocess
 import sys
-from urllib.parse import urlparse
 import tempfile
 import time
 import webbrowser
@@ -55,12 +54,6 @@ FEISHU_DRIVE_LINK_FIELD = os.getenv("FEISHU_DRIVE_LINK_FIELD", "").strip()
 FEISHU_EXPORT_DIR = os.getenv("FEISHU_EXPORT_DIR", "").strip()
 # 为 1/true/yes 时：不把封面上传 Drive、不写 Sheet 封面列，只把封面原图保存到上面导出目录（方便你直接复制到飞书）
 SKIP_DRIVE_COVER = os.getenv("SKIP_DRIVE_COVER", "").strip().lower() in ("1", "true", "yes")
-# 为 1/true/yes 时：每条视频处理完后直接调飞书 API 写入「封面」列和「Drive 链接」列，无需再手动跑 push_export_to_feishu.py
-FEISHU_PUSH_DIRECT = os.getenv("FEISHU_PUSH_DIRECT", "").strip().lower() in ("1", "true", "yes")
-# 飞书作为数据来源：视频链接列名（如 发布链接）；设置后从飞书读取待处理记录，替代 Google 表格
-FEISHU_URL_FIELD = os.getenv("FEISHU_URL_FIELD", "").strip()
-# 每次最多处理条数（默认 50）
-FEISHU_MAX_BATCH = int(os.getenv("FEISHU_MAX_BATCH", "50").strip())
 # 本次运行做哪一类：DO_VIDEO=1 下载并上传视频到 Drive、写回链接；DO_COVER=1 下载封面并导出到 FEISHU_EXPORT_DIR。可只开一个或两个都开
 DO_VIDEO = os.getenv("DO_VIDEO", "1").strip().lower() not in ("0", "false", "no")
 DO_COVER = os.getenv("DO_COVER", "1").strip().lower() not in ("0", "false", "no")
@@ -85,8 +78,10 @@ SOCKET_TIMEOUT = int(os.getenv("SOCKET_TIMEOUT", "120" if SLOW_NETWORK else "60"
 DOWNLOAD_RETRIES = int(os.getenv("DOWNLOAD_RETRIES", "8" if SLOW_NETWORK else "5").strip())
 DOWNLOAD_DELAY_SECONDS = float(os.getenv("DOWNLOAD_DELAY_SECONDS", "10" if SLOW_NETWORK else "5").strip())
 DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT", "900" if SLOW_NETWORK else "600").strip())  # 单条总超时(秒)，慢速模式 15 分钟
+# Drive 上传（httplib2）单次连接超时，大文件或慢网可加大；默认慢网 20 分钟
 DRIVE_HTTP_TIMEOUT = int(os.getenv("DRIVE_HTTP_TIMEOUT", "1200" if SLOW_NETWORK else "600").strip())
 
+# yt-dlp 子进程 stderr 常混入本机 Python 的 FutureWarning/urllib3 等，干扰判断真实失败原因
 _YTDLP_NOISE_MARKERS = (
     "FutureWarning:",
     "NotOpenSSLWarning:",
@@ -116,32 +111,6 @@ def _is_instagram_url(url: str) -> bool:
         return False
     u = url.strip().lower()
     return "instagram.com" in u or "instagr.am" in u
-
-
-def _instagram_unsupported_url_hint(url: str) -> Optional[str]:
-    """
-    若为 Ins 主页、Reels 列表页等 yt-dlp 无法作为「单条视频」处理的 URL，返回简短说明；否则返回 None。
-    """
-    if not _is_instagram_url(url):
-        return None
-    try:
-        path = (urlparse(url.strip()).path or "").strip("/")
-    except Exception:
-        return None
-    parts = [p.lower() for p in path.split("/") if p]
-    if not parts:
-        return None
-    if parts[0] == "stories":
-        return "Instagram「快拍」无法用本脚本下载，请改用单条贴文链接（/p/短码）或 Reel（/reel/短码）。"
-    # 单段路径视为用户主页，如 /nextlevel3dstudio
-    if len(parts) == 1:
-        return "Instagram「主页」无法下载单条视频；请打开具体贴文或 Reel，复制含 /p/ 或 /reel/ 的链接填入表格。"
-    # …/用户名/reels/ 等列表页
-    if parts[-1] == "reels":
-        return "Instagram「Reels 列表」页（…/reels/）不支持；请点开单条 Reel，复制地址栏中含 /reel/短码 的链接。"
-    if len(parts) == 2 and parts[1] in ("tagged", "followers", "following", "saved", "guide", "channel"):
-        return "该链接不是单条贴文/Reel；请使用 /p/ 或 /reel/ 形式的单条链接。"
-    return None
 
 
 def _is_x_twitter_url(url: str) -> bool:
@@ -323,6 +292,7 @@ def get_drive_creds():
 
 
 def build_drive_service(creds):
+    """Drive API 客户端；拉长 httplib2 超时，减少大文件上传时出现 timed out。"""
     http = AuthorizedHttp(creds, http=httplib2.Http(timeout=DRIVE_HTTP_TIMEOUT))
     return build("drive", "v3", http=http, cache_discovery=False)
 
@@ -352,158 +322,15 @@ def get_sheet_data():
             continue
         if not url.startswith("http"):
             continue
-        safe_name = re.sub(r'[\r\n\t]', " ", name)
-        safe_name = re.sub(r'[<>:"/\\|?*]', "_", safe_name)
-        safe_name = re.sub(r'\s+', " ", safe_name).strip()[:200]
+        safe_name = re.sub(r'[<>:"/\\|?*]', "_", name)[:200]
         sheet_row_1based = HEADER_ROWS + idx + 1
         data.append((url, safe_name, sheet_row_1based))
     return data, sheet
 
 
-def _extract_feishu_text_or_link(val) -> str:
-    """从飞书字段值提取纯文本/链接（兼容字符串、超链接对象、列表格式）。"""
-    if val is None:
-        return ""
-    if isinstance(val, str):
-        return val.strip()
-    if isinstance(val, list) and val:
-        item = val[0]
-        if isinstance(item, dict):
-            return (item.get("link") or item.get("text") or item.get("value") or "").strip()
-        if isinstance(item, str):
-            return item.strip()
-    if isinstance(val, dict):
-        return (val.get("link") or val.get("text") or "").strip()
-    return ""
-
-
-def get_feishu_data():
-    """从飞书多维表格读取待处理记录，返回 (data, token, field_ids)。
-    data 每项：(url, base_name, record_id, has_drive_link, has_cover)
-    has_drive_link / has_cover 标记该记录在飞书中是否已有对应内容，均为 True 时自动跳过。
-    最多返回 FEISHU_MAX_BATCH 条。
-    """
-    import feishu as _feishu
-
-    if not FEISHU_URL_FIELD:
-        raise SystemExit("请在 .env 中设置 FEISHU_URL_FIELD（飞书中存放视频链接的列名，如：发布链接）")
-    if not _feishu.FEISHU_MATCH_FIELD:
-        raise SystemExit("请在 .env 中设置 FEISHU_MATCH_FIELD（飞书中存放广告名的列名）")
-
-    print("飞书：正在获取 token…")
-    token = _feishu.feishu_tenant_token()
-    if not token:
-        raise SystemExit("飞书 token 获取失败，请检查 FEISHU_APP_ID / FEISHU_APP_SECRET")
-
-    field_ids = _feishu.feishu_get_field_ids(token)
-    if not field_ids:
-        raise SystemExit("飞书字段列表获取失败，请检查 FEISHU_APP_TOKEN / FEISHU_TABLE_ID")
-
-    required = [FEISHU_URL_FIELD, _feishu.FEISHU_MATCH_FIELD]
-    missing = [f for f in required if f not in field_ids]
-    if missing:
-        raise SystemExit(
-            f"飞书表中找不到以下列，请检查 .env 列名拼写：{missing}\n现有列（部分）：{list(field_ids.keys())[:20]}"
-        )
-
-    FEISHU_DATE_FIELD = "Upload Achieve Date(投放)"  # 按此列日期从新到旧排序
-
-    print("飞书：正在拉取表格记录…")
-    all_records = _feishu.feishu_list_records(token)
-    print(f"飞书：共获取 {len(all_records)} 条记录，正在筛选…")
-
-    _invalid_url_prefixes = (
-        "https://www.tiktok.com/?",
-        "https://tiktok.com/?",
-        "https://www.instagram.com/?",
-        "https://www.youtube.com/?",
-    )
-
-    candidates = []
-    skipped_done = 0
-    skipped_empty = 0
-
-    for rec in all_records:
-        fields = rec.get("fields") or {}
-        record_id = rec.get("record_id", "")
-
-        url = _extract_feishu_text_or_link(fields.get(FEISHU_URL_FIELD))
-        if not url or not url.startswith("http") or any(url.startswith(p) for p in _invalid_url_prefixes):
-            skipped_empty += 1
-            continue
-
-        name = _extract_feishu_text_or_link(fields.get(_feishu.FEISHU_MATCH_FIELD))
-        if not name:
-            skipped_empty += 1
-            continue
-
-        base_name = re.sub(r'[\r\n\t]', " ", name)
-        base_name = re.sub(r'[<>:"/\\|?*]', "_", base_name)
-        base_name = re.sub(r'\s+', " ", base_name).strip()[:200]
-
-        drive_val = fields.get(_feishu.FEISHU_DRIVE_LINK_FIELD) if _feishu.FEISHU_DRIVE_LINK_FIELD else None
-        has_drive_link = bool(drive_val and _extract_feishu_text_or_link(drive_val))
-
-        cover_val = fields.get(_feishu.FEISHU_FILE_FIELD) if _feishu.FEISHU_FILE_FIELD else None
-        has_cover = bool(cover_val and isinstance(cover_val, list) and len(cover_val) > 0)
-
-        if has_drive_link and has_cover:
-            skipped_done += 1
-            continue
-
-        # 读取日期字段（飞书日期列返回毫秒时间戳或字符串，统一转为可比较的数值）
-        date_val = fields.get(FEISHU_DATE_FIELD)
-        if isinstance(date_val, (int, float)):
-            sort_key = date_val
-        elif isinstance(date_val, str) and date_val.strip():
-            try:
-                sort_key = float(date_val.strip())
-            except ValueError:
-                sort_key = 0
-        else:
-            sort_key = 0
-
-        candidates.append((sort_key, url, base_name, record_id, has_drive_link, has_cover))
-
-    # 按日期从新到旧排序，只取最新一天的所有记录
-    candidates.sort(key=lambda x: x[0], reverse=True)
-
-    import datetime
-    def _ts(ms):
-        try:
-            return datetime.datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d")
-        except Exception:
-            return "未知"
-
-    # 找出最新日期，只取同一天的
-    latest_date = _ts(candidates[0][0]) if candidates else None
-    if latest_date and latest_date != "未知":
-        candidates = [c for c in candidates if _ts(c[0]) == latest_date]
-    else:
-        # 没有日期信息时回退到最多 FEISHU_MAX_BATCH 条
-        candidates = candidates[:FEISHU_MAX_BATCH]
-
-    data = [(url, base_name, rid, hdl, hc) for _, url, base_name, rid, hdl, hc in candidates]
-
-    skip_msg = []
-    if skipped_done:
-        skip_msg.append(f"{skipped_done} 条已完成跳过")
-    if skipped_empty:
-        skip_msg.append(f"{skipped_empty} 条无链接/名称跳过")
-    if latest_date:
-        skip_msg.append(f"仅处理最新日期 {latest_date}")
-    print(f"飞书：{len(data)} 条需要处理。{'（' + '、'.join(skip_msg) + '）' if skip_msg else ''}")
-    return data, token, field_ids
-
-
 def _is_youtube_url(url: str) -> bool:
     """判断是否为 YouTube / YouTube Shorts 链接（用于回退策略）。"""
     return "youtube.com" in url or "youtu.be" in url
-
-
-def _is_youtube_shorts_url(url: str) -> bool:
-    """判断是否为 YouTube Shorts 链接。"""
-    return "youtube.com/shorts/" in url
 
 
 def download_video(
@@ -518,25 +345,15 @@ def download_video(
     用 yt-dlp 下载视频到 output_dir，支持 Instagram / X (Twitter) / TikTok / YouTube / YouTube Shorts / 小红书 等；画质优先 bestvideo+bestaudio 高清。
     with_thumbnail=True 时同时下载封面图（与视频同目录，命名为左列文件名，不含 _cover）。
     画质：优先 bestvideo+bestaudio 合并，确保原画质或最高可用画质。
-    YouTube：优先 android_vr（无需 GVS PO Token）；若格式不可用再回退 ios,mweb。
+    YouTube 若因 GVS PO Token/格式不可用失败，会自动用不需要 PO Token 的客户端（android_vr）重试。
     返回 (视频路径, 封面路径或 None, 失败时的详细错误或 None)。
     """
     out_tpl = str(output_dir / f"{base_name}.%(ext)s")
-    is_yt = _is_youtube_url(url)
-    is_shorts = _is_youtube_shorts_url(url)
-    # Shorts 优先用 web 客户端（较少触发限速且无需 PO Token）；
-    # 普通 YouTube 先试 android_vr（无需 GVS PO Token），失败再试 ios,mweb；
-    # 非 YouTube 只跑一轮；--extractor-args 仅作用于对应站点。
-    extractor_args_list = (
-        ["youtube:player_client=android_vr", "youtube:player_client=ios,mweb"]
-        if is_yt  # Shorts 与普通 YouTube 同策略，android_vr 无需 JS 挑战
-        else ["youtube:player_client=ios,mweb"]
-    )
-    ig_hint = _instagram_unsupported_url_hint(url)
-    if ig_hint:
-        print(f"  下载失败: {ig_hint}")
-        return None, None, ig_hint
-
+    # 可选：youtube 客户端。首次用 ios,mweb；失败且为 YouTube 时用 android_vr（无需 PO Token）
+    extractor_args_list = [
+        "youtube:player_client=ios,mweb",   # 绕过 web 的 n challenge
+        "youtube:player_client=android_vr", # 回退：不需要 GVS PO Token，见 https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide
+    ]
     last_err: Optional[str] = None
     for extractor_args in extractor_args_list:
         cmd = [
@@ -545,11 +362,8 @@ def download_video(
             "--merge-output-format", "mp4",
             "-o", out_tpl,
             "--no-part",
-            "-N", "4",                   # 4 个并发分片，对 DASH 流效果明显
-            "--throttled-rate", "100K",  # YouTube 限速时自动重试其他格式
             "--socket-timeout", str(SOCKET_TIMEOUT),
             "--retries", str(DOWNLOAD_RETRIES),
-            "--fragment-retries", str(DOWNLOAD_RETRIES),
             "--extractor-args", extractor_args,
             url,
         ]
@@ -562,12 +376,6 @@ def download_video(
         elif COOKIES_FROM_BROWSER:
             cmd.extend(["--cookies-from-browser", COOKIES_FROM_BROWSER])
         try:
-            if is_yt:
-                pc = extractor_args.split("=", 1)[-1] if "=" in extractor_args else extractor_args
-                label = "Shorts" if is_shorts else "YouTube"
-                print(f"  yt-dlp 下载中（{label} player_client={pc}），最长约 {DOWNLOAD_TIMEOUT}s，请稍候…")
-            else:
-                print(f"  yt-dlp 下载中，最长约 {DOWNLOAD_TIMEOUT}s，请稍候…")
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=DOWNLOAD_TIMEOUT)
             if result.returncode == 0:
                 last_err = None
@@ -576,31 +384,17 @@ def download_video(
             err = _sanitize_ytdlp_stderr(raw) or raw
             last_err = err
             print(f"  下载失败: {err[:500]}" + ("…" if len(err) > 500 else ""))
-            raw_l = raw.lower()
-            if "marked as broken" in raw_l or "yt-dlp -u" in raw_l:
-                print("  提示: 执行 python -m pip install -U yt-dlp 升级到最新版；Instagram 还需在 .env 中配置 COOKIES_FILE 或 COOKIES_FROM_BROWSER。")
             if _is_cookie_database_error(raw):
                 print("  提示: 请完全关闭 Chrome/Edge，或在任务管理器中结束相关进程后重试；或改用 Firefox（.env 中 COOKIES_FROM_BROWSER=firefox）。")
-            # YouTube：android_vr 失败且可能是格式/校验问题时，再试 ios,mweb
-            if is_yt and extractor_args == "youtube:player_client=android_vr":
-                if any(
-                    x in raw
-                    for x in (
-                        "Requested format is not available",
-                        "Only images are available",
-                        "n challenge solving failed",
-                    )
-                ):
-                    print("  正在换用 ios/mweb 客户端重试…")
+            # 仅对 YouTube 且因格式/PO Token 导致不可用时，尝试下一客户端
+            if extractor_args == "youtube:player_client=ios,mweb" and _is_youtube_url(url):
+                if "Requested format is not available" in raw or "Only images are available" in raw or "GVS PO Token" in raw or "n challenge solving failed" in raw:
+                    print("  正在用备用 YouTube 客户端重试（无需 PO Token）…")
                     continue
             return None, None, err
         except (FileNotFoundError, subprocess.TimeoutExpired) as e:
             last_err = str(e)
             print(f"  下载失败: {e}")
-            return None, None, last_err
-        except Exception as e:
-            last_err = f"{type(e).__name__}: {e}"
-            print(f"  下载失败: {last_err}")
             return None, None, last_err
     if last_err:
         return None, None, last_err
@@ -630,11 +424,6 @@ def download_thumbnail_only(
     url: str, output_dir: Path, base_name: str, cookies_file: Optional[str] = None
 ) -> Tuple[Optional[Path], Optional[Path], Optional[str]]:
     """只下载封面图（不下载视频），返回 (None, 封面路径, 失败时的简短原因)。封面按左列文件名命名，不含 _cover。"""
-    ig_hint = _instagram_unsupported_url_hint(url)
-    if ig_hint:
-        print(f"  下载封面失败: {ig_hint}")
-        return None, None, ig_hint
-
     thumb_tpl = str(output_dir / f"{base_name}.%(ext)s")
     # 先试仅要封面、不指定 format；若报 Requested format / Only images 再用 bestimage 重试
     cmd = [
@@ -701,10 +490,6 @@ def download_thumbnail_only(
         if _is_cookie_database_error(str(e)):
             print("  提示: 请完全关闭 Chrome/Edge 或在任务管理器中结束相关进程后重试；或改用 Firefox。")
         return None, None, str(e).strip()
-    except Exception as e:
-        msg = f"{type(e).__name__}: {e}"
-        print(f"  下载封面失败: {msg}")
-        return None, None, msg
 
 
 def _find_thumbnail(output_dir: Path, base_name: str) -> Optional[Path]:
@@ -743,232 +528,129 @@ def _set_drive_file_anyone_can_view(service, file_id: str) -> None:
 
 
 def upload_to_drive(
-    service, file_path: Path, name: str, folder_id: Optional[str], allow_public_view: bool = False,
-    creds=None,
+    service, file_path: Path, name: str, folder_id: Optional[str], allow_public_view: bool = False
 ) -> Tuple[bool, Optional[str], Optional[str]]:
-    """上传文件到 Google Drive，返回 (是否成功, 查看链接, file_id)。
-    优先用 requests（AuthorizedSession）发起分块上传，绕过 httplib2 在某些网络环境下
-    丢失 Location header 的问题；creds 为 None 时回退到原 service 方式。
-    """
-    if creds is not None:
-        return _upload_to_drive_requests(creds, file_path, name, folder_id, allow_public_view, service)
-    # 回退：原 httplib2 路径
+    """上传文件到 Google Drive，返回 (是否成功, 查看链接, file_id)。service 由调用方 build 一次传入，避免批量时重复建连。"""
     body = {"name": name}
     if folder_id:
         body["parents"] = [folder_id]
-    media = MediaFileUpload(str(file_path), resumable=True, chunksize=4 * 1024 * 1024)
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
-        try:
-            result = (
-                service.files()
-                .create(body=body, media_body=media, fields="id")
-                .execute(num_retries=8)
-            )
-            file_id = result.get("id")
-            if file_id and allow_public_view:
-                _set_drive_file_anyone_can_view(service, file_id)
-            link = f"https://drive.google.com/file/d/{file_id}/view" if file_id else None
-            return True, link, file_id
-        except Exception as e:
-            err_msg = str(e)
-            print(f"  上传失败(第{attempt}次): {err_msg[:200]}")
-            if attempt < max_attempts:
-                wait = 2 ** attempt
-                print(f"  等待 {wait}s 后重试…")
-                time.sleep(wait)
-                media = MediaFileUpload(str(file_path), resumable=True, chunksize=4 * 1024 * 1024)
-    return False, None, None
-
-
-def _upload_to_drive_requests(
-    creds, file_path: Path, name: str, folder_id: Optional[str], allow_public_view: bool, service
-) -> Tuple[bool, Optional[str], Optional[str]]:
-    """用 requests（AuthorizedSession）做分块上传，避免 httplib2 redirect 问题。"""
-    from google.auth.transport.requests import AuthorizedSession
-    import json as _json
-
-    CHUNK = 8 * 1024 * 1024  # 8 MB
-    file_size = file_path.stat().st_size
-    metadata = {"name": name}
-    if folder_id:
-        metadata["parents"] = [folder_id]
-
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
-        try:
-            session = AuthorizedSession(creds)
-            # 1. 发起 resumable upload，获取上传 URL
-            init_resp = session.post(
-                "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable",
-                headers={"Content-Type": "application/json; charset=UTF-8",
-                         "X-Upload-Content-Length": str(file_size)},
-                data=_json.dumps(metadata).encode(),
-                timeout=60,
-            )
-            if init_resp.status_code not in (200, 201):
-                raise Exception(f"初始化上传失败 HTTP {init_resp.status_code}: {init_resp.text[:200]}")
-            upload_url = init_resp.headers.get("Location")
-            if not upload_url:
-                raise Exception("初始化响应缺少 Location header")
-
-            # 2. 分块 PUT
-            file_id = None
-            with open(file_path, "rb") as f:
-                offset = 0
-                while offset < file_size:
-                    chunk = f.read(CHUNK)
-                    end = offset + len(chunk) - 1
-                    put_resp = session.put(
-                        upload_url,
-                        headers={
-                            "Content-Range": f"bytes {offset}-{end}/{file_size}",
-                            "Content-Length": str(len(chunk)),
-                        },
-                        data=chunk,
-                        timeout=DRIVE_HTTP_TIMEOUT,
-                    )
-                    if put_resp.status_code in (200, 201):
-                        file_id = put_resp.json().get("id")
-                        break
-                    if put_resp.status_code == 308:  # Resume Incomplete，继续下一块
-                        offset += len(chunk)
-                        continue
-                    raise Exception(f"上传块失败 HTTP {put_resp.status_code}: {put_resp.text[:200]}")
-
-            if not file_id:
-                raise Exception("上传完成但未获取到 file_id")
-            if allow_public_view:
-                _set_drive_file_anyone_can_view(service, file_id)
-            link = f"https://drive.google.com/file/d/{file_id}/view"
-            return True, link, file_id
-
-        except Exception as e:
-            print(f"  上传失败(第{attempt}次): {str(e)[:200]}")
-            if attempt < max_attempts:
-                wait = 2 ** attempt
-                print(f"  等待 {wait}s 后重试…")
-                time.sleep(wait)
-    return False, None, None
+    media = MediaFileUpload(str(file_path), resumable=True)
+    try:
+        result = service.files().create(body=body, media_body=media, fields="id").execute()
+        file_id = result.get("id")
+        if file_id and allow_public_view:
+            _set_drive_file_anyone_can_view(service, file_id)
+        link = f"https://drive.google.com/file/d/{file_id}/view" if file_id else None
+        return True, link, file_id
+    except Exception as e:
+        print(f"  上传失败: {e}")
+        return False, None, None
 
 
 def main():
-    # 命令行覆盖：python main.py video | cover | both，不传则用 .env（影响 need_video/need_cover 逻辑）
-    force_video, force_cover = None, None
+    global DO_VIDEO, DO_COVER
+    # 命令行覆盖：python main.py video | cover | both，不传则用 .env
     if len(sys.argv) > 1:
         mode = sys.argv[1].strip().lower()
         if mode == "video":
-            force_video, force_cover = True, False
+            DO_VIDEO, DO_COVER = True, False
         elif mode == "cover":
-            force_video, force_cover = False, True
+            DO_VIDEO, DO_COVER = False, True
         elif mode == "both":
-            force_video, force_cover = True, True
-
-    # 从飞书读取待处理记录
-    data, feishu_token, feishu_field_ids = get_feishu_data()
+            DO_VIDEO, DO_COVER = True, True
+    data, sheet = get_sheet_data()
     if not data:
-        print("没有待处理的记录（所有记录已完成，或飞书表中无有效链接/名称）。")
+        print("没有可处理的链接/命名数据，请检查表格和 URL_COLUMN、NAME_COLUMN、HEADER_ROWS。")
         return
-
-    import feishu as _feishu
-    ensure_login_if_needed([(url, name, 0) for url, name, *_ in data])
+    if not DO_VIDEO and not DO_COVER:
+        print("DO_VIDEO 与 DO_COVER 至少开启一个。用法: python main.py [video|cover|both]")
+        return
+    # 若有 Instagram 链接且未配置登录，弹出一劳永逸的登录引导并写入 .env
+    ensure_login_if_needed(data)
+    # 使用 Chrome/Edge 时先检测能否读 cookie，避免整批都报同一错误
     ensure_browser_cookies_ready()
-
-    net_msg = ""
+    result_col = _column_letter_to_index(RESULT_COLUMN) + 1 if (RESULT_COLUMN and DO_VIDEO) else None
+    if DO_VIDEO and not RESULT_COLUMN:
+        print("提示: 未设置 RESULT_COLUMN，视频 Drive 链接将不会写回表格。请在 .env 中设置 RESULT_COLUMN（如 C）。")
+    thumb_col = _column_letter_to_index(THUMBNAIL_COLUMN) + 1 if (THUMBNAIL_COLUMN and not SKIP_DRIVE_COVER and DO_COVER) else None
+    with_thumb = DO_COVER and (bool(THUMBNAIL_COLUMN and not SKIP_DRIVE_COVER) or bool(FEISHU_EXPORT_DIR))
+    msg = f"共 {len(data)} 条待处理。本次："
+    msg += "视频" if DO_VIDEO else ""
+    msg += "+封面" if DO_VIDEO and DO_COVER else ("封面" if DO_COVER else "")
+    msg += "。"
+    if result_col:
+        msg += f" 视频链接写回第 {RESULT_COLUMN} 列。"
+    if thumb_col:
+        msg += f" 封面链接写回第 {THUMBNAIL_COLUMN} 列。"
+    if DO_COVER and FEISHU_EXPORT_DIR and not thumb_col:
+        msg += f" 封面原图导出到 {FEISHU_EXPORT_DIR}。"
     if SLOW_NETWORK or SOCKET_TIMEOUT > 30 or DOWNLOAD_DELAY_SECONDS > 0:
         slow_note = "慢速网络模式 " if SLOW_NETWORK else ""
-        net_msg = f" [{slow_note}超时={SOCKET_TIMEOUT}s, 重试={DOWNLOAD_RETRIES}, 间隔={DOWNLOAD_DELAY_SECONDS}s, 单条最长={DOWNLOAD_TIMEOUT}s]"
-    print(f"开始处理 {len(data)} 条（每次上限 {FEISHU_MAX_BATCH} 条）{net_msg}")
-
+        msg += f" [{slow_note}超时={SOCKET_TIMEOUT}s, 重试={DOWNLOAD_RETRIES}, 每条间隔={DOWNLOAD_DELAY_SECONDS}s, 单条最长={DOWNLOAD_TIMEOUT}s]"
+    print(msg)
     cookies = COOKIES_FILE or None
     folder_id = DRIVE_FOLDER_ID or None
-    drive_creds = get_drive_creds()
-    drive_service = build_drive_service(drive_creds)
-
-    failures = []  # (base_name, record_id, 原因, 详细错误)
-    success_count = 0
-
-    for i, (url, base_name, record_id, has_drive_link, has_cover) in enumerate(data, 1):
-        # 命令行模式覆盖按需逻辑
-        if force_video is not None:
-            need_video = force_video
-            need_cover = force_cover
-        else:
-            need_video = not has_drive_link
-            need_cover = not has_cover
-
-        status_parts = []
-        if not need_video and has_drive_link:
-            status_parts.append("Drive链接已有")
-        if not need_cover and has_cover:
-            status_parts.append("封面已有")
-        status_hint = f"（{', '.join(status_parts)}）" if status_parts else ""
-        print(f"[{i}/{len(data)}] {base_name}{status_hint}")
-
+    drive_service = None
+    if DO_VIDEO or thumb_col:
+        creds = get_drive_creds()
+        drive_service = build_drive_service(creds)
+    failures = []  # (base_name, 原因, 详细错误信息, 表格行号)
+    for i, (url, base_name, sheet_row) in enumerate(data, 1):
+        print(f"[{i}/{len(data)}] {base_name}")
         with tempfile.TemporaryDirectory() as tmpdir:
             video_path, thumb_path = None, None
             drive_link = ""
-            item_failed = False
-
-            if need_video:
+            if DO_VIDEO:
                 video_path, thumb_path, download_err = download_video(
-                    url, Path(tmpdir), "video", cookies,
-                    with_thumbnail=need_cover, thumb_base_name=base_name,
+                    url, Path(tmpdir), "video", cookies, with_thumbnail=DO_COVER, thumb_base_name=base_name
                 )
                 if not video_path:
                     if _is_cookie_database_error(download_err):
-                        print("  请完全关闭 Chrome/Edge 后按回车重试，或输入 s 跳过。")
+                        print("  请完全关闭 Chrome/Edge（或任务管理器中结束进程）后按回车重试本条，或输入 s 跳过。")
                         r = input("  [回车=重试, s=跳过]: ").strip().lower()
                         if r != "s":
                             video_path, thumb_path, download_err = download_video(
-                                url, Path(tmpdir), "video", cookies,
-                                with_thumbnail=need_cover, thumb_base_name=base_name,
+                                url, Path(tmpdir), "video", cookies, with_thumbnail=DO_COVER, thumb_base_name=base_name
                             )
                     if not video_path:
-                        failures.append((base_name, record_id, "下载视频失败", download_err or "未知错误"))
+                        failures.append((base_name, "下载视频失败", download_err or "未知错误", sheet_row))
                         continue
                 final_name = base_name if base_name.endswith(video_path.suffix) else base_name + video_path.suffix
-                ok, drive_link, _ = upload_to_drive(
-                    drive_service, video_path, final_name, folder_id,
-                    allow_public_view=False, creds=drive_creds,
-                )
+                ok, drive_link, _ = upload_to_drive(drive_service, video_path, final_name, folder_id, allow_public_view=False)
+                if not ok:
+                    ok, drive_link, _ = upload_to_drive(drive_service, video_path, final_name, folder_id, allow_public_view=False)  # 重试一次
                 if ok:
-                    print(f"  已上传视频到 Drive: {final_name}")
+                    print(f"  已上传视频: {final_name}")
+                    if result_col and drive_link:
+                        try:
+                            sheet.update_cell(sheet_row, result_col, drive_link)
+                            print(f"  已写回第 {RESULT_COLUMN} 列")
+                        except Exception as e:
+                            print(f"  写回第 {RESULT_COLUMN} 列失败: {e}")
                 else:
-                    print(f"  Drive 上传失败，跳过: {final_name}")
-                    failures.append((base_name, record_id, "Drive 上传失败", "详见上方输出"))
-                    item_failed = True
-
-            elif need_cover:
-                # 只需封面，不下载视频
+                    print(f"  跳过上传视频: {final_name}")
+            else:
+                # 仅封面（按左列文件名命名，不含 _cover）
                 _, thumb_path, thumb_err = download_thumbnail_only(url, Path(tmpdir), base_name, cookies)
                 if not thumb_path:
-                    failures.append((base_name, record_id, "下载封面失败", thumb_err or "未知错误"))
+                    failures.append((base_name, "下载封面失败", thumb_err or "未知错误", sheet_row))
                     continue
                 print(f"  已下载封面")
-
-            # 统一把 .image 后缀改为 .jpg
+            # 导出/上传时统一把 .image 改为 .jpg，避免系统无法识别
             if thumb_path:
                 ext = ".jpg" if thumb_path.suffix.lower() == ".image" else thumb_path.suffix
                 thumb_name = base_name + ext
             else:
                 thumb_name = None
-
-            # 写入飞书
-            ftok = None
-            if need_cover and thumb_path and thumb_name:
-                ftok = _feishu.feishu_upload_media(thumb_path, thumb_name, feishu_token)
-                if not ftok:
-                    print(f"  飞书封面上传失败，仅写链接列")
-
-            if (ftok or (need_video and drive_link)) and not item_failed:
-                _feishu.feishu_update_record(
-                    feishu_token, record_id, ftok, feishu_field_ids,
-                    drive_link=drive_link or None,
+            if thumb_path and thumb_col:
+                ok_thumb, _, thumb_file_id = upload_to_drive(
+                    drive_service, thumb_path, thumb_name, folder_id, allow_public_view=True
                 )
-
-            # 本地导出（可选）
-            if thumb_path and thumb_name and FEISHU_EXPORT_DIR:
+                if ok_thumb and thumb_file_id:
+                    direct_url = f"https://drive.google.com/uc?export=view&id={thumb_file_id}"
+                    sheet.update_cell(sheet_row, thumb_col, f'=IMAGE("{direct_url}")')
+                    print(f"  已上传封面并在第 {THUMBNAIL_COLUMN} 列显示图片")
+            if thumb_path and thumb_name and DO_COVER and FEISHU_EXPORT_DIR:
                 export_root = Path(FEISHU_EXPORT_DIR).expanduser().resolve()
                 export_root.mkdir(parents=True, exist_ok=True)
                 covers_dir = export_root / "covers"
@@ -983,33 +665,41 @@ def main():
                         if write_header:
                             w.writerow([FEISHU_MATCH_FIELD or "命名", FEISHU_DRIVE_LINK_FIELD or "视频Drive链接", "封面文件名"])
                         w.writerow([base_name, drive_link, thumb_name])
+                    print(f"  已导出到 {export_root}（封面原图在 covers/，可复制到飞书）")
                 except Exception as e:
-                    print(f"  本地导出失败: {e}")
-
-            if not item_failed:
-                success_count += 1
-
+                    print(f"  导出到本地失败: {e}")
+        # 慢速网络：每条任务之间间隔，避免连接被限速或超时
         if i < len(data) and DOWNLOAD_DELAY_SECONDS > 0:
             time.sleep(DOWNLOAD_DELAY_SECONDS)
-
     # 汇总
-    print(f"\n{'=' * 60}")
-    print(f"完成：共 {len(data)} 条，成功 {success_count} 条，失败 {len(failures)} 条。")
+    ok_count = len(data) - len(failures)
+    print(f"\n共 {len(data)} 条：成功 {ok_count} 条。")
     if failures:
-        print(f"\n失败明细：")
-        for name, record_id, reason, detail in failures:
-            short_detail = (detail or "").splitlines()[0][:120] if detail else ""
-            print(f"  - {name}  [record_id: {record_id}]")
-            print(f"    原因: {reason}  |  {short_detail}")
-        print(f"\n{'=' * 60}")
-        print("失败详情（完整）")
+        print(f"失败 {len(failures)} 条：")
+        for name, reason, _, _ in failures:
+            print(f"  - {name}: {reason}")
+        # 详细失败原因，便于复制
+        print("\n" + "=" * 60)
+        print("失败详情（可复制）")
         print("=" * 60)
-        for idx, (name, record_id, reason, detail) in enumerate(failures, 1):
-            print(f"\n【{idx}】{name}  (record_id: {record_id})")
-            print(f"  原因: {reason}")
+        for idx, (name, reason, detail, _) in enumerate(failures, 1):
+            print(f"\n【{idx}】{name}")
+            print(f"  类型: {reason}")
+            print(f"  详细:")
             for line in (detail or "").splitlines():
                 print(f"    {line}")
+            print()
         print("=" * 60)
+        # 在表格中高亮失败行（整行浅红底）
+        failed_rows = [row for (_, _, _, row) in failures]
+        if failed_rows:
+            try:
+                fmt = cellFormat(backgroundColor=color(1.0, 0.85, 0.85))  # 浅红
+                for row in failed_rows:
+                    format_cell_range(sheet, f"{row}:{row}", fmt)
+                print(f"已在表格中高亮 {len(failed_rows)} 行（失败行）。")
+            except Exception as e:
+                print(f"高亮失败行时出错（不影响结果）: {e}")
 
 
 if __name__ == "__main__":

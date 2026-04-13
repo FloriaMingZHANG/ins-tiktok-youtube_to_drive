@@ -7,9 +7,11 @@ token.json
 *.json
 !config.example.env
 instagram_cookies.txt
+cookies.txt
 __pycache__/
 .venv/
 venv/
 *.pyc
 .DS_Store
 feishu_export/
+.claude/
